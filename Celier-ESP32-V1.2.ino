@@ -9,9 +9,8 @@
 #include "DHT.h"          // temperature and humidity sensor library (adafruit)
 #include <WiFi.h>
 #include "Time.h"         // Time library
-#include <NTPClient.h>    // web time update
-#include <WiFiUdp.h>      // used by web time update
 #include <JPEGDecoder.h>  // JPEG decoder library
+#include "esp_task_wdt.h" // task watchdog: reboots the board if loop() ever stops running
 //#include "LittleFS.h"   // Use this library for ESP8266
 #include "FS.h"
 #include "LITTLEFS.h"     // Use this library for ESP32S
@@ -29,10 +28,14 @@
 // Screen defaults
 // **********************************
 #define TFT_DEFAULT_ROTATION  1
-#define WIFI_TIMEOUT_MS       20000   // WIFI connection timeout in ms
+#define WIFI_RETRY_INTERVAL_MS    30000 // If WiFi is still not connected this long after an attempt started, start a new attempt
+#define WIFI_RADIO_RESET_ATTEMPTS 5     // After this many failed attempts in a row, power-cycle the WiFi radio
+#define WDT_TIMEOUT_S             20    // Task watchdog timeout. loop() must run at least this often or the board reboots
 #define TFT_TRANSPARENT_COLOR TFT_WHITE
 
 #define TEMP_DEFAULT_SETPOINT 15
+#define TEMP_SETPOINT_MIN     5       // Setpoints outside this range are rejected (serial command / setpoint.txt)
+#define TEMP_SETPOINT_MAX     25
 #define TEMP_TFT_TEXT_POS_X   150
 #define TEMP_TFT_TEXT_POS_Y   120
 #define TEMP_TFT_TEXT_WIDTH   195
@@ -164,12 +167,18 @@ const char *snowIconFile = "/snowflake-icon.bmp";
 uint16_t snowTFTBuffer[SNOW_ICON_WIDTH * SNOW_ICON_HEIGHT];
 const char *waterDropFile = "/water-droplets-icon.bmp";
 
-// Initialize WiFi and web time update
+// WiFi credentials files and connection state. WiFi is handled by wifiService() in loop(),
+// it never blocks, so a missing/dropped WiFi cannot stall the temperature control.
 const char *ssidFile = "/SSID.txt";
 const char *passwordFile = "/password.txt";
-const long utcOffsetInSeconds = -5 * 60 * 60; // UTC -5 hours
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
+char wifiSSID[33];                  // 32 chars max for SSID names
+char wifiPassword[64];              // 63 chars max for WPA2 passphrases
+bool wifiCredentialsLoaded = false;
+bool wifiWasConnected = false;      // connection state seen by the previous wifiService() call
+bool wifiServicesStarted = false;   // OTA + web server are started once, the first time we connect
+uint32_t wifiAttemptStartMs = 0;    // when the current connection attempt started
+uint8_t wifiFailedAttempts = 0;
+volatile uint8_t wifiLastDisconnectReason = 0;  // written by the WiFi event task, read by loop()
 
 const char *setPointFile = "/setpoint.txt";
 const char *logFileName = "/log.txt";
@@ -178,6 +187,7 @@ const char *debugFileName = "/debug.txt";
 // Global variables
 uint16_t* ptrTimeTFTBuf;  // To save background under time area
 uint16_t timeTFTBuffer[TIME_TFT_TEXT_WIDTH * TIME_TFT_TEXT_HEIGHT]; // TFT buffer to restore background before printing new time
+uint16_t wifiIconTFTBuffer[WIFI_ICON_WIDTH * WIFI_ICON_HEIGHT];     // TFT buffer to restore background when the wifi icon is removed
 char currentTime[10];     // string holder for current time
 int32_t timePosX = TIME_TFT_TEXT_POS_X;       // TFT position for current time
 int32_t timePosY = TIME_TFT_TEXT_POS_Y;       // TFT position for current time
@@ -186,7 +196,7 @@ int32_t timeHeight;
 int oldHours,oldMinutes;  // Keep old time value and only update when it has changed
 TimerEvent timerTime;
 
-float fCelierTemperature; // temperature inside the Celier read by DHT sensor
+float fCelierTemperature = NAN; // temperature inside the Celier read by DHT sensor (NAN until the first valid reading)
 uint16_t* tempBuffer;     // to save background under temperature text area
 uint16_t tempTFTBuffer[TEMP_TFT_TEXT_WIDTH * TEMP_TFT_TEXT_HEIGHT];
 char currentTemp[6];      // string holder for current temperature
@@ -240,13 +250,12 @@ uint32_t secondsCounter = 0;
 DHT dht(DHTPIN, DHTTYPE);
 SerialCommand sCmd;     // The SerialCommand object
 
+// Runs in the WiFi event task, NOT in loop(). Keep it tiny: no TFT, no filesystem, no Serial here.
+// (The old handler redrew the whole screen from this task while loop() was also using the TFT/SPI bus
+//  and the filesystem, and it fired on every failed reconnect attempt. That is what hung the board.)
+// The screen is updated by wifiService() in loop() instead.
 void WiFiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info){
-  Serial.println("Disconnected from WiFi access point");
-  Serial.print("WiFi lost connection. Reason: ");
-  Serial.println(info.disconnected.reason);
-  drawBmp(backgroundFile, 0, 0);  // redraw background to erase time and wifi logo
-  //Serial.println("Trying to Reconnect");
-  //WiFi.begin(ssid, password);
+  wifiLastDisconnectReason = info.disconnected.reason;
 }
 
 void setup() {
@@ -303,18 +312,30 @@ void setup() {
   //***************************************************************
   Serial.println("Mounting file system...");
   if (!LittleFS.begin()) {
+    // Don't return from setup(): the timers below must still be set up or the TEC would never be controlled.
+    // Without the file system we just run with the default setpoint, no images and no WiFi credentials.
     Serial.println("LittleFS mount failed");
-    return;
   }
-  Serial.println("file system mounted!");
-  
-  char setPointString[5];
-  if (readTextFile(setPointFile, setPointString))
+  else
   {
-    String tempString = setPointString;
-    Serial.print("Set point file conatains: ");
-    Serial.print(setPointString);
-    TempSetpoint = tempString.toFloat();
+    Serial.println("file system mounted!");
+  }
+
+  char setPointString[16];
+  float fileSetpoint;
+  if (readTextFile(setPointFile, setPointString, sizeof(setPointString)))
+  {
+    Serial.print("Set point file contains: ");
+    Serial.println(setPointString);
+    if (parseSetpoint(setPointString, &fileSetpoint))
+    {
+      TempSetpoint = fileSetpoint;
+    }
+    else
+    {
+      Serial.println("Set point in file is invalid, using default.");
+      TempSetpoint = TEMP_DEFAULT_SETPOINT;
+    }
   }
   else
   {
@@ -337,109 +358,17 @@ void setup() {
   // Get snowflake icon background to erase it when needed...
   tft.readRect(SNOW_ICON_POS_X,SNOW_ICON_POS_Y,SNOW_ICON_WIDTH,SNOW_ICON_HEIGHT,snowTFTBuffer);
 
-/*  
-  //***************************************************************
-  // Init Wifi by reading SSID.txt and password.txt files
-  //***************************************************************
-  char wifiSSID[33];  // SSID name holder 32 bytes MAX for SSID names
-  char pw[64];        // password name holder
-  long TimeoutCounter = millis();
-  if ((readTextFile(ssidFile,wifiSSID)) & (readTextFile(passwordFile,pw)))
-  {
-    WiFi.onEvent(WiFiStationDisconnected, SYSTEM_EVENT_STA_DISCONNECTED);
-    WiFi.begin(wifiSSID, pw); // Connect to WiFi with SSID and pw from filesystem
-    while (WiFi.status() != WL_CONNECTED) // Check if connection is established
-    {
-      delay(500); // Set delay to 0.5s
-      Serial.print("."); // Print dots on serial monitor until connection is established
-      if ((millis() - TimeoutCounter) > WIFI_TIMEOUT_MS)
-      {
-        break;
-      }
-    }
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      ArduinoOTA
-        .onStart([]() {
-          String type;
-          if (ArduinoOTA.getCommand() == U_FLASH)
-            type = "sketch";
-          else // U_SPIFFS
-            type = "filesystem";
-    
-          // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-          Serial.println("Start updating " + type);
-        })
-        .onEnd([]() {
-          Serial.println("\nEnd");
-        })
-        .onProgress([](unsigned int progress, unsigned int total) {
-          Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-        })
-        .onError([](ota_error_t error) {
-          Serial.printf("Error[%u]: ", error);
-          if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-          else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-          else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-          else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-          else if (error == OTA_END_ERROR) Serial.println("End Failed");
-        });
-    
-      ArduinoOTA.begin();
-      Serial.print("IP address: ");
-      Serial.println(WiFi.localIP());
-    }
-    else
-    {
-      Serial.println("WIFI Timeout reached. No WIFI Support");
-    }
-  }
-  else
-  {
-    Serial.println("No WIFI support!");
-  }
-*/
-  connectToWifi();
-  // Get time update from web if wifi is connected
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    configTime(0, 0, "pool.ntp.org");    // First connect to NTP server, with 0 TZ offset
-    setenv("TZ","EST5EDT,M3.2.0,M11.1.0",1);
-    tzset();
-    getLocalTime(&timeinfo);
-    Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S zone %Z %z ");
-    
-    Serial.print("Connected to WiFi.");
-    drawBmp(wifiIconFile, WIFI_ICON_POS_X, SNOW_ICON_POS_Y);
-    timeClient.begin();
-    timeClient.update();
-    sprintf(currentTime,"%02u:%02u",timeinfo.tm_hour,timeinfo.tm_min);
-    //sprintf(currentTime,"%02u:%02u",timeClient.getHours(),timeClient.getMinutes());
-    oldHours = timeinfo.tm_hour; //timeClient.getHours();
-    oldMinutes = timeinfo.tm_min; //timeClient.getMinutes();
-    // Setup font, color, position then save background and print time on TFT
-    tft.setTextColor(TFT_DARKGREY);
-    tft.loadFont(TIME_FONT, LittleFS);  
-    timeWidth = tft.textWidth(currentTime);
-    timeHeight = tft.fontHeight();
-    Serial.println(timeWidth);
-    Serial.println(timeHeight);
-    tft.readRect(timePosX,timePosY,TIME_TFT_TEXT_WIDTH,TIME_TFT_TEXT_HEIGHT,timeTFTBuffer);
-    tft.setCursor(timePosX,timePosY);
-    tft.print(currentTime);
-    tft.unloadFont();
+  // Save the background under the time and wifi icon areas, so they can be erased later.
+  // This is done here (not after connecting) so it works even when WiFi is not available at boot.
+  tft.readRect(timePosX,timePosY,TIME_TFT_TEXT_WIDTH,TIME_TFT_TEXT_HEIGHT,timeTFTBuffer);
+  tft.readRect(WIFI_ICON_POS_X,WIFI_ICON_POS_Y,WIFI_ICON_WIDTH,WIFI_ICON_HEIGHT,wifiIconTFTBuffer);
 
-    // Setup web server 
-    server.serveStatic("/", LittleFS, "/");//.setDefaultFile("index.html");
-    // Route for root / web page
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-      request->send(LittleFS, "/index.html", String(), false, processor);
-    });
-    server.begin();
-    // Print ESP32 Local IP Address
-    Serial.print("Web server at IP ");
-    Serial.println(WiFi.localIP());
-  }  
+  //***************************************************************
+  // Start WiFi (NON-BLOCKING). Connection, retries, OTA, web server and time sync
+  // are all handled by wifiService() in loop(), whenever WiFi is available.
+  //***************************************************************
+  wifiInit();
+
 
 /*
   tft.loadFont(TEMP_FONT, LittleFS);
@@ -461,6 +390,19 @@ void setup() {
   timerTime.set(TIME_UPDATE_INTERVAL,updateTimeCallback);
   timerScreensaver.set(TFT_SCREENSAVER_TIME,updateScreenSaver);
   timerBacklight.set(backlightDimmingSpeed,updateBacklightLevel);
+
+  // Task watchdog: if loop() ever stops running for WDT_TIMEOUT_S seconds (WiFi/driver lock-up, etc.)
+  // the board reboots instead of staying frozen with the TEC possibly stuck on.
+  // Only the Arduino loop task is watched; the idle task of core 0 is removed from the watch list so heavy
+  // WiFi activity can't trigger a reset by starving it.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  esp_task_wdt_config_t wdtConfig = { WDT_TIMEOUT_S * 1000, 0, true };
+  esp_task_wdt_reconfigure(&wdtConfig);
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  esp_task_wdt_delete(xTaskGetIdleTaskHandleForCPU(0));
+#endif
+  esp_task_wdt_add(NULL);   // watch the current (loop) task
 }
 
 // Update the backlight level until the setpoint is reached
@@ -514,7 +456,7 @@ void updateTempCallback(void)
   fCelierTemperature = dht.readTemperature(); // Current temp in Celsius
   if (isnan(fCelierTemperature)) 
   {
-    consecutiveNANs++;
+    if (consecutiveNANs < 255) consecutiveNANs++;   // saturate: uint8_t would wrap around to 0 after 255 failures
     if (consecutiveNANs > TEMP_NAN_TIMEOUT)
     {
       // if temp value is no good, don't change display
@@ -580,10 +522,10 @@ void updateTimeCallback(void)
   
   // if no wifi, exit without updating time
   if (WiFi.status() != WL_CONNECTED) return;
-  
-  //timeClient.update();
-  getLocalTime(&timeinfo);
-  //if ((oldMinutes != timeClient.getMinutes()) | (oldHours != timeClient.getHours()))
+
+  // Timeout of 0: never wait here. The default is 5 seconds, which froze the whole
+  // loop every time the clock had not been synchronised yet (no internet / NTP unreachable).
+  if (!getLocalTime(&timeinfo, 0)) return;
   if ((oldMinutes != timeinfo.tm_min) | (oldHours != timeinfo.tm_hour))
   {
     oldHours = timeinfo.tm_hour;
@@ -605,6 +547,9 @@ void updateTimeCallback(void)
 
 void loop() {
 
+  esp_task_wdt_reset();   // Tell the watchdog that loop() is still alive
+
+  wifiService();          // Non-blocking WiFi connect / reconnect / status display
   ArduinoOTA.handle();    // Used to update the firmware via WIFI
 
   sCmd.readSerial();     // We don't do much, just process serial commands
@@ -650,6 +595,9 @@ void loop() {
         waterLevelHyst = -WATER_DETECTED_HYST;
         // Water detected! Show water icon and stop cooling TEC but not fans
         Serial.println("*** WATER LEVEL EXCEEDED!!! ***");
+        // Turn the TEC off right now. updateTempCallback() returns early while water is detected,
+        // so without this the TEC kept running in whatever state it was in.
+        TEC_Control(TEC_OFF);
         backlightSetpoint = BL_PWM_HI_VAL;
         timerScreensaver.reset();
         LEDlightSetpoint = LEDS_PWM_HI_VAL;
@@ -667,7 +615,11 @@ void loop() {
         Serial.println("Water level OK...");
         timerScreensaver.enable();
         drawBmp(backgroundFile, 0, 0);
-        oldval = 0; // This forces the temperature to be updated now
+        // The background redraw erased everything: force temperature, humidity, time and wifi icon to be redrawn
+        oldval = -1;
+        OldCelierHumidity = 0xFFFF;
+        oldMinutes = -1;
+        oldHours = -1;
       }
     }
   }
@@ -683,10 +635,10 @@ void loop() {
 // *****************************************
 // Read file contents and return it in *ptr
 // *****************************************
-bool readTextFile(const char * path, char *ptr)
+bool readTextFile(const char * path, char *ptr, size_t maxLen)
 {
-  char *p;
-  p = ptr;
+  if (maxLen == 0) return false;
+  ptr[0] = 0;
   if (!LittleFS.exists(path)) return false;
   File f = LittleFS.open(path, "r");
   if (!f) 
@@ -694,15 +646,37 @@ bool readTextFile(const char * path, char *ptr)
     //Serial.println("Failed to open SSID file!"); 
     return false;
   }
-  int i = 0;
-  while (f.available()) 
+  size_t i = 0;
+  while (f.available() && (i < (maxLen - 1)))   // never write past the end of the caller's buffer
   {
-    *p = f.read();
-    i++;
-    p++;
+    ptr[i++] = f.read();
   }
-  *p = 0;  // add string terminator
+  ptr[i] = 0;  // add string terminator
   f.close();
+  // Strip trailing CR/LF, so a text editor adding a new line at the end of the file
+  // doesn't become part of the SSID / password / setpoint.
+  while ((i > 0) && ((ptr[i-1] == '\n') || (ptr[i-1] == '\r')))
+  {
+    ptr[--i] = 0;
+  }
+  return true;
+}
+
+// *****************************************
+// Parse and validate a temperature setpoint.
+// Returns false (and leaves *result untouched) if the text is not a number in the allowed range.
+// (String.toFloat() returns 0 for garbage, which would have switched the setpoint to 0 degrees.)
+// *****************************************
+bool parseSetpoint(const char *text, float *result)
+{
+  char *endPtr;
+  float value = strtof(text, &endPtr);
+  if (endPtr == text) return false;                       // no digits at all
+  while ((*endPtr == ' ') || (*endPtr == '\t') || (*endPtr == '\r') || (*endPtr == '\n')) endPtr++;
+  if (*endPtr != 0) return false;                         // trailing garbage
+  if (isnan(value)) return false;
+  if ((value < TEMP_SETPOINT_MIN) || (value > TEMP_SETPOINT_MAX)) return false;
+  *result = value;
   return true;
 }
 
@@ -803,11 +777,13 @@ void updateTempSetPoint()
   char *arg;
   arg = sCmd.next();    // Get the next argument from the SerialCommand object buffer
   if (arg != NULL) {    // As long as it existed, take it
-    String tmp = arg;
-    float tmpSetPoint = tmp.toFloat();
-    if (isnan(tmpSetPoint))
+    float tmpSetPoint;
+    if (!parseSetpoint(arg, &tmpSetPoint))
     {
-      Serial.print("Invalid number!");
+      Serial.print("Invalid setpoint! Must be a number from ");
+      Serial.print(TEMP_SETPOINT_MIN);
+      Serial.print(" to ");
+      Serial.println(TEMP_SETPOINT_MAX);
     }
     else
     {
@@ -815,13 +791,17 @@ void updateTempSetPoint()
       File file = LittleFS.open(setPointFile, "w");
       if (file)
       {
-        file.print(tmp);
+        file.print(arg);
+        file.close();
+      }
+      else
+      {
+        Serial.println("Could not save setpoint to file system, it will be lost at next reboot.");
       }
       TempSetpoint = tmpSetPoint;
       Serial.print("New temperature setpoint is ");
       Serial.print(TempSetpoint);
       Serial.println("°C.");
-      file.close();
     }
   }
 }
@@ -833,83 +813,174 @@ void unrecognized(const char *command) {
 
 // Replaces placeholder with LED state value in web page
 String processor(const String& var){
-  String RetVal;
-  
-  Serial.println(var);
   if(var == "TEMPERATURE"){
-    RetVal = String(fCelierTemperature);
-    Serial.print(RetVal);
-    return RetVal;
+    if (isnan(fCelierTemperature)) return String("--");   // no valid reading (yet)
+    return String(fCelierTemperature);
   }
   if(var == "SETPOINT"){
-    RetVal = String(TempSetpoint);
-    Serial.print(RetVal);
-    return RetVal;
+    return String(TempSetpoint);
   }
   return String();
 }
 
-void connectToWifi(void)
+// *****************************************
+// WiFi handling. Nothing in here blocks: it is called from loop() and returns right away.
+// *****************************************
+
+// Read credentials from the file system and start the first connection attempt (does not wait for it).
+void wifiInit(void)
 {
-  //***************************************************************
-  // Init Wifi by reading SSID.txt and password.txt files
-  //***************************************************************
-  char wifiSSID[33];  // SSID name holder 32 bytes MAX for SSID names
-  char pw[64];        // password name holder
-  long TimeoutCounter = millis();
-  if ((readTextFile(ssidFile,wifiSSID)) & (readTextFile(passwordFile,pw)))
+  if (readTextFile(ssidFile, wifiSSID, sizeof(wifiSSID)) && readTextFile(passwordFile, wifiPassword, sizeof(wifiPassword)) && (wifiSSID[0] != 0))
   {
+    wifiCredentialsLoaded = true;
+    WiFi.persistent(false);       // don't rewrite the credentials in flash at every connection attempt
     WiFi.onEvent(WiFiStationDisconnected, SYSTEM_EVENT_STA_DISCONNECTED);
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
     WiFi.hostname(WIFI_NEW_HOSTNAME);
-    WiFi.begin(wifiSSID, pw); // Connect to WiFi with SSID and pw from filesystem
-    while (WiFi.status() != WL_CONNECTED) // Check if connection is established
-    {
-      delay(500); // Set delay to 0.5s
-      Serial.print("."); // Print dots on serial monitor until connection is established
-      if ((millis() - TimeoutCounter) > WIFI_TIMEOUT_MS)
-      {
-        break;
-      }
-    }
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      ArduinoOTA
-        .onStart([]() {
-          String type;
-          if (ArduinoOTA.getCommand() == U_FLASH)
-            type = "sketch";
-          else // U_SPIFFS
-            type = "filesystem";
-    
-          // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-          Serial.println("Start updating " + type);
-        })
-        .onEnd([]() {
-          Serial.println("\nEnd");
-        })
-        .onProgress([](unsigned int progress, unsigned int total) {
-          Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-        })
-        .onError([](ota_error_t error) {
-          Serial.printf("Error[%u]: ", error);
-          if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-          else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-          else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-          else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-          else if (error == OTA_END_ERROR) Serial.println("End Failed");
-        });
-    
-      ArduinoOTA.begin();
-      Serial.print("IP address: ");
-      Serial.println(WiFi.localIP());
-    }
-    else
-    {
-      Serial.println("WIFI Timeout reached. No WIFI Support");
-    }
+    WiFi.begin(wifiSSID, wifiPassword); // Connect to WiFi with SSID and pw from filesystem
+    wifiAttemptStartMs = millis();
+    Serial.println("WiFi connection started in background.");
   }
   else
   {
     Serial.println("No WIFI support!");
+  }
+}
+
+// Start a new connection attempt (used when the previous one did not succeed).
+void wifiRestartAttempt(void)
+{
+  wifiFailedAttempts++;
+  Serial.print("WiFi not connected, retrying (attempt ");
+  Serial.print(wifiFailedAttempts);
+  Serial.print(", last disconnect reason ");
+  Serial.print(wifiLastDisconnectReason);
+  Serial.println(")");
+  if (wifiFailedAttempts >= WIFI_RADIO_RESET_ATTEMPTS)
+  {
+    // Plain retries are not enough: power-cycle the WiFi radio.
+    wifiFailedAttempts = 0;
+    Serial.println("Restarting WiFi radio");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.hostname(WIFI_NEW_HOSTNAME);
+  }
+  else
+  {
+    WiFi.disconnect();
+  }
+  WiFi.begin(wifiSSID, wifiPassword);
+  wifiAttemptStartMs = millis();
+}
+
+// Called once each time the connection comes up.
+void wifiOnConnected(void)
+{
+  Serial.print("Connected to WiFi. IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // (Re)start time sync. The clock is then read without waiting in updateTimeCallback().
+  configTime(0, 0, "pool.ntp.org");    // First connect to NTP server, with 0 TZ offset
+  setenv("TZ","EST5EDT,M3.2.0,M11.1.0",1);
+  tzset();
+
+  drawBmp(wifiIconFile, WIFI_ICON_POS_X, WIFI_ICON_POS_Y);
+  oldHours = -1;      // force the time to be drawn at the next time update
+  oldMinutes = -1;
+
+  // OTA and web server only need to be started once, they keep working across reconnections.
+  if (!wifiServicesStarted)
+  {
+    wifiServicesStarted = true;
+
+    ArduinoOTA
+      .onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH)
+          type = "sketch";
+        else // U_SPIFFS
+          type = "filesystem";
+        // An OTA upload can keep ArduinoOTA.handle() busy for longer than the watchdog timeout
+        esp_task_wdt_delete(NULL);
+        // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
+        Serial.println("Start updating " + type);
+      })
+      .onEnd([]() {
+        Serial.println("\nEnd");
+      })
+      .onProgress([](unsigned int progress, unsigned int total) {
+        Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+      })
+      .onError([](ota_error_t error) {
+        esp_task_wdt_add(NULL);   // update failed, we keep running: watch the loop task again
+        Serial.printf("Error[%u]: ", error);
+        if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+        else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+        else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+        else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+        else if (error == OTA_END_ERROR) Serial.println("End Failed");
+      });
+    ArduinoOTA.begin();
+
+    // Setup web server. Only the files the web page needs are served.
+    // (The old serveStatic("/", LittleFS, "/") published EVERY file of the file system, including
+    //  SSID.txt and password.txt, to anyone on the network.)
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(LittleFS, "/index.html", String(), false, processor);
+    });
+    server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(LittleFS, "/style.css", "text/css");
+    });
+    server.on("/red_temp_icon.png", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(LittleFS, "/red_temp_icon.png", "image/png");
+    });
+    server.on("/green_temp_icon.png", HTTP_GET, [](AsyncWebServerRequest *request){
+      request->send(LittleFS, "/green_temp_icon.png", "image/png");
+    });
+    server.begin();
+    Serial.print("Web server at IP ");
+    Serial.println(WiFi.localIP());
+  }
+}
+
+// Called once each time the connection is lost.
+void wifiOnDisconnected(void)
+{
+  Serial.print("WiFi lost connection. Reason: ");
+  Serial.println(wifiLastDisconnectReason);
+  // Erase the wifi icon and the time. Only those two areas are restored: the temperature,
+  // humidity and snowflake icon must stay on screen.
+  tft.pushRect(WIFI_ICON_POS_X, WIFI_ICON_POS_Y, WIFI_ICON_WIDTH, WIFI_ICON_HEIGHT, wifiIconTFTBuffer);
+  tft.pushRect(timePosX, timePosY, TIME_TFT_TEXT_WIDTH, TIME_TFT_TEXT_HEIGHT, timeTFTBuffer);
+}
+
+// Call this from loop(). Detects connect / disconnect and retries when the connection is down.
+void wifiService(void)
+{
+  if (!wifiCredentialsLoaded) return;
+
+  bool connected = (WiFi.status() == WL_CONNECTED);
+
+  if (connected && !wifiWasConnected)
+  {
+    wifiWasConnected = true;
+    wifiFailedAttempts = 0;
+    wifiOnConnected();
+  }
+  else if (!connected && wifiWasConnected)
+  {
+    wifiWasConnected = false;
+    wifiAttemptStartMs = millis();   // WiFi core is already trying to reconnect, give it some time before we step in
+    wifiOnDisconnected();
+  }
+  else if (!connected)
+  {
+    if ((millis() - wifiAttemptStartMs) >= WIFI_RETRY_INTERVAL_MS)
+    {
+      wifiRestartAttempt();
+    }
   }
 }

@@ -10,6 +10,9 @@ const char *digit7File = "/7-neon.bmp";
 const char *digit8File = "/8-neon.bmp";
 const char *digit9File = "/9-neon.bmp";
 
+#define BMP_MAX_WIDTH   480   // sanity limit: protects the line buffer on the stack from a corrupt BMP header
+#define BMP_MAX_HEIGHT  480
+
 uint16_t drawBmp(const char *filename, int16_t x, int16_t y) {
 
   if ((x >= tft.width()) || (y >= tft.height())) return 0;
@@ -26,11 +29,13 @@ uint16_t drawBmp(const char *filename, int16_t x, int16_t y) {
   }
   if (bmpFS.size() <= 0)
   {
-    Serial.print("*** FILE ERROR *** Empty File! *** FILE ERROR ***");
+    Serial.println("*** FILE ERROR *** Empty File! *** FILE ERROR ***");
+    bmpFS.close();
+    return 0;
   }
  
   uint32_t seekOffset;
-  uint16_t w, h, row, col;
+  uint16_t w = 0, h = 0, row, col;   // w is returned to the caller, it must never be uninitialised
   uint8_t  r, g, b;
 
   uint32_t startTime = millis();
@@ -41,8 +46,16 @@ uint16_t drawBmp(const char *filename, int16_t x, int16_t y) {
     read32(bmpFS);
     seekOffset = read32(bmpFS);
     read32(bmpFS);
-    w = read32(bmpFS);
-    h = read32(bmpFS);
+    uint32_t bmpW = read32(bmpFS);
+    uint32_t bmpH = read32(bmpFS);
+    if ((bmpW == 0) || (bmpW > BMP_MAX_WIDTH) || (bmpH == 0) || (bmpH > BMP_MAX_HEIGHT))
+    {
+      Serial.println("BMP size not supported.");
+      bmpFS.close();
+      return 0;
+    }
+    w = bmpW;
+    h = bmpH;
 
     if ((read16(bmpFS) == 1) && (read16(bmpFS) == 24) && (read32(bmpFS) == 0))
     {
@@ -142,4 +155,5 @@ uint16_t drawBMPDigit(uint8_t digit, int16_t x, int16_t y)
       return drawBmp(digit9File, x, y);
     break;
   }
+  return 0;   // not a digit: draw nothing (a non-void function must always return a value)
 }
