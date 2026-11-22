@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta http-equiv="refresh" content="30">
+  <title>Celier V2.0</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" type="text/css" href="style.css">
+</head>
+<body onload="{UpdateTemperatureVariable()}">
+  <div id="STATE_VAR"></div>
+  <h1>Celier V2.0 Web Server</h1>
+  <p>Current wine temperature: <strong>%TEMPERATURE%&deg;C</strong></p>
+  <p>Desired wine temperature: <strong>%SETPOINT%&deg;C</strong></p>
+  <img src="" id="Temp_Icon_Src">
+</body>
+<script>
+	var dummy = "%TEMPERATURE%";
+	function UpdateTemperatureVariable() {
+		CurTemp = parseFloat(dummy);
+		if (CurTemp > 16)
+			document.getElementById("Temp_Icon_Src").src="/red_temp_icon.png";
+		else
+			document.getElementById("Temp_Icon_Src").src="/green_temp_icon.png";
+	}
+</script>
+</html>
